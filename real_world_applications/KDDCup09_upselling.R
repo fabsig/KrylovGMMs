@@ -1,0 +1,176 @@
+library(gpboost)
+library(lme4)
+library(glmmTMB)
+library(foreign)
+
+set.seed(1)
+
+###Import data##################################################################
+setwd(dirname(rstudioapi::getSourceEditorContext()$path))
+my_data <- read.arff("./../data/real_world/KDDCup09_upselling.arff")
+
+###Prepare data#################################################################
+cat_cols <- c("Var216", "Var217", "Var198", "Var199")
+feat_cols <- paste0("Var",1:190)
+
+#Avoid rank deficiency
+feat_cols <- feat_cols[!(feat_cols %in% c("Var24", "Var35", "Var83", "Var132", "Var173", "V181"))]
+
+#Get column names with many NA values
+na_counts <- colSums(is.na(my_data))
+cols_with_many_na <- names(na_counts)[na_counts > 20000]
+
+#Remove columns
+my_data <- my_data[,!(colnames(my_data) %in% cols_with_many_na)]
+feat_cols <- feat_cols[!(feat_cols %in% cols_with_many_na)]
+
+#Impute numeric variables with the mean
+for (col in feat_cols){
+  my_data[is.na(my_data[,col]), col] <- mean(my_data[, col], na.rm = TRUE)
+}
+
+#New cathegory for NA's
+for (col in cat_cols) {
+  my_data[,col] <- addNA(my_data[,col])
+}
+
+#cat_cols as numeric
+for(col in cat_cols){
+  my_data[,col] <- as.numeric(my_data[,col])
+}
+
+#Categorical variables
+group_data <- as.matrix(my_data[,cat_cols])
+
+#Predictor variables
+X <- model.matrix(~ ., my_data[,feat_cols])
+colnames(X)[1] <- "Intercept"
+
+#Response  
+Y <- as.numeric(my_data$UPSELLING)-1
+
+###Store data info##############################################################
+data_cols <- c("ds_name", "n", "p", "K", "response_var", "class_imbalance", "cat_var", "nr_levels", "nnz_ZtZ")
+data_info <- data.frame(matrix(nrow=length(cat_cols), ncol = length(data_cols)))
+colnames(data_info) <- data_cols
+
+data_info$ds_name[1] <- "KDDCup09_upselling"
+data_info$n[1] <- length(Y)
+data_info$p[1] <- ncol(X) - 1
+data_info$K[1] <- ncol(group_data)
+data_info$response_var[1] <- "up-selling"
+data_info$class_imbalance[1] <- sum(Y)/length(Y)
+
+for(i in 1:ncol(group_data)){
+  data_info$cat_var[i] <- cat_cols[i]
+  data_info$nr_levels[i] <- length(unique(group_data[,cat_cols[i]]))
+}
+
+##Infos on Z^TZ
+parsedFormula <- lFormula(form = paste0("y ~ 1 + ", paste0("(1|",cat_cols,")", collapse = ' + ')), 
+                          data = data.frame(cbind(y=rep(1,dim(group_data)[1]),group_data))) 
+Ztlist <- parsedFormula$reTrms$Ztlist
+for(i in 1:length(Ztlist)){
+  if(i==1){
+    Z <- t(Ztlist[[i]])
+  }else{
+    Z <- cbind(Z, t(Ztlist[[i]]))
+  }
+}
+ZtZ <- t(Z)%*%Z
+data_info$nnz_ZtZ[1] <- nnzero(ZtZ)
+#image(ZtZ, xlab="", ylab="", sub ="", main="upselling")
+
+###Data frames##################################################################
+res_cols <- c("method", "time_estimation", "num_optim_iter", "nll_optimum")
+results <- data.frame(matrix(nrow=4, ncol = length(res_cols)))
+colnames(results) <- res_cols
+
+cov_cols <- c(paste0("sigma2_", 1:length(cat_cols)))
+cov_results <- data.frame(matrix(nrow=4, ncol = length(cov_cols)))
+colnames(cov_results) <- cov_cols
+
+beta_cols <- paste0("beta_", 0:(ncol(X)-1))
+beta_results <- data.frame(matrix(nrow=4, ncol = length(beta_cols)))
+colnames(beta_results) <- beta_cols
+
+###Estimation###################################################################
+i <- 1
+
+#chol_model$get_optim_params()$init_cov_pars
+init_cov_pars <- rep(0.25, ncol(group_data))
+init_betas <- c(-2.53207, rep(0, (ncol(X)-1)))
+
+###Cholesky#####################################################################
+chol_model <- GPModel(group_data = group_data,
+                      likelihood="bernoulli_logit",
+                      matrix_inversion_method = "cholesky")
+
+chol_model$set_optim_params(params = list(maxit=1000,
+                                          trace=T,
+                                          init_cov_pars=init_cov_pars,
+                                          init_coef=init_betas))
+
+results$method[i] <- "Cholesky (GPBoost)"
+results$time_estimation[i] <- system.time(chol_model$fit(y=Y, X=X))[3]
+beta_results[i,] <- chol_model$get_coef()
+cov_results[i,] <- chol_model$get_cov_pars()
+results$nll_optimum[i] <- chol_model$get_current_neg_log_likelihood()
+results$num_optim_iter[i] <- chol_model$get_num_optim_iter()
+
+i <- i + 1
+
+###Krylov#######################################################################
+it_model <- GPModel(group_data = group_data,
+                    likelihood="bernoulli_logit",
+                    matrix_inversion_method = "iterative")
+
+it_model$set_optim_params(params = list(maxit=1000,
+                                        trace=T,
+                                        init_cov_pars=init_cov_pars,
+                                        init_coef=init_betas,
+                                        cg_preconditioner_type="symmetric_successive_over_relaxation"))
+
+results$method[i] <- "Krylov (GPBoost)"
+results$time_estimation[i] <- system.time(it_model$fit(y=Y, X=X))[3]
+beta_results[i,] <- it_model$get_coef()
+cov_results[i,] <- it_model$get_cov_pars()
+results$nll_optimum[i] <- it_model$get_current_neg_log_likelihood()
+results$num_optim_iter[i] <- it_model$get_num_optim_iter()
+
+i <- i + 1
+  
+###glmmTMB####################################################################
+try({
+  formula <- as.formula(paste0("y ~ -1 + ",paste0(colnames(X), collapse = ' + ')," + ",paste0("(1|",cat_cols,")", collapse = ' + '))) 
+  results$time_estimation[i] <- system.time(glmmTMB_model <- glmmTMB(formula, family=binomial, data = data.frame(y = Y, cbind(X, group_data)), 
+                                                                     start=list(theta = init_cov_pars, beta = init_betas)))[3]
+  
+  results$method[i] <- "glmmTMB"
+  beta_results[i,] <- fixef(glmmTMB_model)$cond
+  cov_results[i,] <- as.numeric(VarCorr(glmmTMB_model)$cond)
+  results$nll_optimum[i] <- -as.numeric(summary(glmmTMB_model)$logLik)
+  results$num_optim_iter[i] <- glmmTMB_model$fit$iterations
+})
+
+i <- i + 1
+
+###lme4#########################################################################
+try({
+  formula <- as.formula(paste0("y ~ -1 + ",paste0(colnames(X), collapse = ' + ')," + ",paste0("(1|",cat_cols,")", collapse = ' + '))) 
+  results$time_estimation[i] <- system.time(lme4_model <- glmer(formula, family=binomial, data = data.frame(y = Y, cbind(X, group_data)), start=list(theta = init_cov_pars, fixef = init_betas)
+                                                                #control = glmerControl(optimizer = c("Nelder_Mead")))
+                                            ))[3]
+  
+  results$method[i] <- "lme4"
+  beta_results[i,] <- summary(lme4_model)$coefficients[,1]
+  vr <- as.data.frame(VarCorr(lme4_model))
+  vr <- vr[match(cat_cols, vr$grp),]
+  cov_results[i,] <- vr$vcov
+  results$nll_optimum[i] <- -as.numeric(summary(lme4_model)$logLik)
+  results$num_optim_iter[i] <- lme4_model@optinfo$feval
+})
+
+################################################################################
+all_results <- cbind(results, cov_results, beta_results)
+saveRDS(list(all_results=all_results, data_info=data_info), "./KDDCup09_upselling.rds")
